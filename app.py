@@ -196,6 +196,7 @@ for _k, _v in {
     "lmm_result": None, "lmm_model_df": None,
     "lmm_safe_outcome": None, "lmm_safe_subject": None,
     "anova_result": None,
+    "file_rejection": None,
 }.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
@@ -222,8 +223,19 @@ with st.sidebar:
             st.session_state.df               = None
             st.session_state.ingestion_result = None
             st.session_state.lmm_result       = None
+            st.session_state.lmm_model_df     = None
+            st.session_state.lmm_safe_outcome = None
+            st.session_state.lmm_safe_subject = None
             st.session_state.anova_result     = None
+            st.session_state.auto_roles       = None
+            st.session_state.roles_file       = None
             st.session_state.sheet_names      = get_sheet_names(file_bytes) if uploaded.name.lower().endswith('.xlsx') else None
+            st.session_state.selected_sheets  = None
+            st.session_state.file_rejection   = None
+            # Clear filtered dataframe and any cached summary/result keys
+            for _stale_key in [k for k in st.session_state if k in ("df_filtered",) or
+                                k.startswith(("lmm_sum_", "av_sum_", "fstate_"))]:
+                del st.session_state[_stale_key]
 
     if st.session_state.file_bytes and st.session_state.sheet_names:
         snames = st.session_state.sheet_names
@@ -242,6 +254,7 @@ with st.sidebar:
 
     # Run ingestion
     if (st.session_state.file_bytes and st.session_state.df is None and
+            st.session_state.file_rejection is None and
             (not st.session_state.sheet_names or st.session_state.selected_sheets)):
         try:
             _ing = ingest(
@@ -250,8 +263,40 @@ with st.sidebar:
                 sheet_names=st.session_state.selected_sheets,
                 merge_sheets=st.session_state.merge_sheets or False,
             )
-            st.session_state.df               = _ing.df
-            st.session_state.ingestion_result = _ing
+            # ── Reject files with structural problems ─────────────────────────
+            if _ing.merged_cells_resolved > 0:
+                st.session_state.file_rejection = {
+                    "title": "Merged cells detected",
+                    "reason": (
+                        f"Your file contains <b>{_ing.merged_cells_resolved} merged cell(s)</b>. "
+                        "This app requires a clean, flat table with no merged cells."
+                    ),
+                    "detail": (
+                        "Open your file in Excel, select all cells (Ctrl+A / Cmd+A), "
+                        "then go to <b>Home → Merge & Center → Unmerge Cells</b>. "
+                        "Save the file and re-upload."
+                    ),
+                }
+                st.session_state.file_bytes       = None
+                st.session_state.file_name        = None
+            elif _ing.header_rows_skipped > 0:
+                st.session_state.file_rejection = {
+                    "title": "Multi-row / unrecognised headers detected",
+                    "reason": (
+                        f"Your file has <b>{_ing.header_rows_skipped} extra label row(s)</b> "
+                        "above the column names (e.g. a 'Pre-Intervention' banner row spanning "
+                        "multiple columns). This app requires a single, clean header row."
+                    ),
+                    "detail": (
+                        "Restructure your file so that <b>row 1 contains only the column names</b> "
+                        "and row 2 onwards contains data. Remove any spanning label rows, then re-upload."
+                    ),
+                }
+                st.session_state.file_bytes       = None
+                st.session_state.file_name        = None
+            else:
+                st.session_state.df               = _ing.df
+                st.session_state.ingestion_result = _ing
         except Exception as e:
             st.error(f"Could not read file: {e}")
 
@@ -261,6 +306,16 @@ with st.sidebar:
         if _r and _r.summary_rows_removed:
             st.markdown(f"<div style='font-size:0.72rem;color:#9aa0cc;'>🗑 {_r.summary_rows_removed} junk rows removed</div>", unsafe_allow_html=True)
         st.markdown("<div style='font-size:0.75rem;color:#9aa0cc;margin-top:1rem;'>Configure model in main panel →</div>", unsafe_allow_html=True)
+    elif st.session_state.get("file_rejection"):
+        _rej = st.session_state.file_rejection
+        st.markdown(f"""
+        <div style='background:rgba(200,75,49,0.15);border:1px solid #c84b31;
+            border-radius:8px;padding:0.8rem 1rem;margin-top:0.5rem;'>
+            <div style='color:#ffb3a7;font-size:0.82rem;font-weight:700;margin-bottom:0.3rem;'>
+                🚫 File rejected</div>
+            <div style='color:#f5c6be;font-size:0.75rem;line-height:1.5;'>
+                {_rej["title"]} — see main panel for details.</div>
+        </div>""", unsafe_allow_html=True)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -269,14 +324,43 @@ with st.sidebar:
 st.markdown("# RCT Statistical Analysis\n##### Upload · Configure · Run · Interpret")
 
 if st.session_state.df is None:
-    st.markdown("""
-    <div style='margin-top:3rem;text-align:center;color:#9aa0b8;'>
-        <div style='font-size:3rem;'>📂</div>
-        <div style='font-family:DM Serif Display,serif;font-size:1.4rem;color:#2d3561;margin-top:0.5rem;'>
-            Upload your data to begin</div>
-        <div style='font-size:0.9rem;margin-top:0.4rem;'>Accepts CSV or XLSX</div>
-    </div>""", unsafe_allow_html=True)
+    # ── File rejection modal ──────────────────────────────────────────────────
+    _rej = st.session_state.get("file_rejection")
+    if _rej:
+        st.markdown(f"""
+        <div style='
+            margin:3rem auto; max-width:620px;
+            background:#fffef9; border:1.5px solid #c84b31;
+            border-radius:12px; padding:2rem 2.2rem;
+            box-shadow:0 4px 24px rgba(200,75,49,0.10);
+        '>
+            <div style='display:flex;align-items:center;gap:0.7rem;margin-bottom:1rem;'>
+                <span style='font-size:1.8rem;'>🚫</span>
+                <span style='font-family:DM Serif Display,serif;font-size:1.25rem;
+                    color:#c84b31;font-weight:700;'>{_rej["title"]}</span>
+            </div>
+            <div style='font-size:0.95rem;color:#1a1a2e;line-height:1.7;margin-bottom:1rem;'>
+                {_rej["reason"]}
+            </div>
+            <div style='background:#fef2f2;border-left:3px solid #c84b31;
+                border-radius:0 6px 6px 0;padding:0.7rem 1rem;
+                font-size:0.85rem;color:#7a1a1a;line-height:1.6;'>
+                <b>How to fix:</b><br>{_rej["detail"]}
+            </div>
+            <div style='margin-top:1.2rem;font-size:0.82rem;color:#9aa0b8;'>
+                Upload a corrected file using the sidebar to continue.
+            </div>
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <div style='margin-top:3rem;text-align:center;color:#9aa0b8;'>
+            <div style='font-size:3rem;'>📂</div>
+            <div style='font-family:DM Serif Display,serif;font-size:1.4rem;color:#2d3561;margin-top:0.5rem;'>
+                Upload your data to begin</div>
+            <div style='font-size:0.9rem;margin-top:0.4rem;'>Accepts CSV or XLSX</div>
+        </div>""", unsafe_allow_html=True)
     st.stop()
+
 
 df  = st.session_state.df
 res = st.session_state.ingestion_result
@@ -292,27 +376,9 @@ if res is None:
                           col_rename_map={})
 
 # ─────────────────────────────────────────────────────────────────────────────
-# INGESTION WARNINGS — popup-style alerts for complex file structures
+# INGESTION NOTICES — informational only (wide-format auto-conversion etc.)
 # ─────────────────────────────────────────────────────────────────────────────
 _ing_issues = []
-if res.merged_cells_resolved > 0:
-    _ing_issues.append((
-        "⚠️ Merged cells detected",
-        f"Your file contained <b>{res.merged_cells_resolved} merged cells</b>. "
-        f"The app has filled them with the top-left value, but this may produce "
-        f"unexpected column names or repeated values. "
-        f"<b>Recommended:</b> open your file in Excel, unmerge all cells manually, "
-        f"and re-upload for best results."
-    ))
-if res.header_rows_skipped > 0:
-    _ing_issues.append((
-        "⚠️ Multi-row headers detected",
-        f"Your file had <b>{res.header_rows_skipped} extra header/label row(s)</b> "
-        f"above the actual column names (e.g. a 'Pre-Intervention' label spanning "
-        f"multiple columns). These were skipped, but column names may be incomplete. "
-        f"<b>Recommended:</b> restructure your file so row 1 contains only the column "
-        f"names and re-upload."
-    ))
 if res.format_detected == "wide" and res.wide_cols_melted:
     _ing_issues.append((
         "ℹ️ Wide format converted to long",
@@ -333,6 +399,7 @@ if _ing_issues:
         with st.expander(title, expanded=True):
             st.markdown(f"<div class='warn-box'>{body}</div>", unsafe_allow_html=True)
     st.markdown("---")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA PREVIEW
