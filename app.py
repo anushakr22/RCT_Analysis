@@ -1103,12 +1103,26 @@ elif model_choice == "Mixed Factorial ANOVA":
 
         def _anova_summary(aov, a_out, a_bet, a_wit, ph):
             sents = []
-            # Find p-value column
-            p_col = next((c for c in aov.columns if c.lower() in ("p-unc","p","pr(>f)","p-value")), None)
-            f_col = next((c for c in aov.columns if c.lower() in ("f","f-value","f_val")), None)
-            e_col = next((c for c in aov.columns if c.lower() in ("np2","eta2","eta2[g]","pes")), None)
-            src_col = next((c for c in aov.columns if c.lower() in ("source","a","b")), None)
+            # Normalise: lowercase + replace underscores with hyphens so both
+            # "p_unc" (pingouin) and "p-unc" (other libs) match the same token
+            def _norm(s): return s.strip().lower().replace("_", "-")
+            norm_map = {c: _norm(c) for c in aov.columns}
 
+            p_col   = next((c for c in aov.columns if norm_map[c] in ("p-unc","p","pr(>f)","p-value")), None)
+            f_col   = next((c for c in aov.columns if norm_map[c] in ("f","f-value","f-val")), None)
+            e_col   = next((c for c in aov.columns if norm_map[c] in ("np2","eta2","eta2[g]","pes","ng2")), None)
+            src_col = next((c for c in aov.columns if norm_map[c] in ("source","a","b")), None)
+
+            if p_col is None:
+                # Last-resort: any column whose name contains "p" and holds [0,1] values
+                for c in aov.columns:
+                    if "p" in c.lower():
+                        try:
+                            vals = pd.to_numeric(aov[c], errors="coerce").dropna()
+                            if len(vals) and vals.between(0, 1).all():
+                                p_col = c; break
+                        except Exception:
+                            pass
             if p_col is None:
                 return "Could not parse ANOVA table for summary."
 
