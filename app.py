@@ -417,7 +417,6 @@ with st.expander("🔍  Data preview", expanded=True):
     with st.expander("Column details"):
         st.dataframe(pd.DataFrame({
             "Column":   df.columns,
-            "Type":     [str(df[c].dtype) for c in df.columns],
             "Non-null": [int(df[c].notna().sum()) for c in df.columns],
             "Unique":   [int(df[c].nunique()) for c in df.columns],
             "Sample":   [str(df[c].dropna().iloc[0]) if df[c].notna().any() else "—" for c in df.columns],
@@ -566,7 +565,16 @@ if model_choice == "Linear Mixed Model (LMM)":
         if lmm_cust.strip():
             for pair in lmm_cust.split(","):
                 pts = [p.strip() for p in pair.split(":")]
-                if len(pts) == 2: lmm_interactions.append(tuple(pts))
+                if len(pts) == 2:
+                    a_var, b_var = pts[0], pts[1]
+                    # Auto-add variables to fixed effects if not already there
+                    if a_var in all_cols and a_var not in lmm_fixed:
+                        lmm_fixed.append(a_var)
+                    if b_var in all_cols and b_var not in lmm_fixed:
+                        lmm_fixed.append(b_var)
+                    lmm_interactions.append((a_var, b_var))
+                else:
+                    st.markdown(f"<div class='warn-box'>⚠ Invalid interaction: <code>{pair.strip()}</code> — use format <code>A:B</code></div>", unsafe_allow_html=True)
 
     with r2c:
         st.markdown("<div style='font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;'>Random slopes</div>", unsafe_allow_html=True)
@@ -590,7 +598,15 @@ if model_choice == "Linear Mixed Model (LMM)":
 
     fe_terms = list(s_fe)
     for a, b in s_ixn:
-        if a in s_fe and b in s_fe: fe_terms.append(f"{a}:{b}")
+        # Re-sanitize s_fe after possible additions from custom interactions
+        current_s_fe = [sanitize_col(c) for c in lmm_fixed]
+        if a not in current_s_fe:
+            current_s_fe.append(a)
+            fe_terms.append(a)
+        if b not in current_s_fe:
+            current_s_fe.append(b)
+            fe_terms.append(b)
+        fe_terms.append(f"{a}:{b}")
     rhs        = " + ".join(fe_terms) if fe_terms else "1"
     formula    = f"{s_out} ~ {rhs}"
     re_formula = ("~" + " + ".join(s_slopes)) if s_slopes else None
