@@ -636,7 +636,36 @@ if model_choice == "Linear Mixed Model (LMM)":
                     if df_safe[col].dtype == object or df_safe[col].nunique() <= 10:
                         mdf = mdf.copy(); mdf[col] = pd.Categorical(mdf[col])
                 md  = mixedlm(formula, mdf, groups=mdf[s_sub], re_formula=re_formula)
-                res_lmm = md.fit(method="lbfgs", reml=False, maxiter=2000)
+                # Try multiple optimizers in sequence — lbfgs fails on singular
+                # random-effects covariance (common with only 2 timepoints)
+                res_lmm = None
+                _fit_errors = []
+                for _method in ["lbfgs", "bfgs", "powell", "nm"]:
+                    try:
+                        res_lmm = md.fit(method=_method, reml=True, maxiter=2000)
+                        if res_lmm is not None:
+                            if _method != "lbfgs":
+                                st.markdown(
+                                    f"<div class='warn-box'>⚠ Default optimiser (lbfgs) failed — "
+                                    f"model fitted using <b>{_method}</b>. This is usually fine but "
+                                    f"may indicate the random-effects variance is near zero (singular). "
+                                    f"Check the diagnostic plots carefully.</div>",
+                                    unsafe_allow_html=True,
+                                )
+                            break
+                    except np.linalg.LinAlgError as _e:
+                        _fit_errors.append(f"{_method}: {_e}")
+                    except Exception as _e:
+                        _fit_errors.append(f"{_method}: {_e}")
+                        break  # non-linalg errors won't be solved by retrying
+
+                if res_lmm is None:
+                    raise RuntimeError(
+                        "All optimisers failed. This usually means the model is "
+                        "over-specified for your data — try removing the group variable "
+                        "or interaction term, or check for collinear predictors. "
+                        f"Details: {'; '.join(_fit_errors)}"
+                    )
                 st.session_state.lmm_result       = res_lmm
                 st.session_state.lmm_model_df     = mdf
                 st.session_state.lmm_safe_outcome = s_out
