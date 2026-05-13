@@ -129,34 +129,7 @@ def apply_baseline_correction(df, outcome_col, subject_col, time_col):
     df = df.copy()
     unique_times = df[time_col].dropna().unique()
 
-    # Priority 1: numeric sort
-    try:
-        time_order = sorted(unique_times, key=lambda x: float(x))
-    except (ValueError, TypeError):
-        # Priority 2: semantic pre/baseline/post ordering
-        _sem_order = {
-            "baseline": 0, "pre": 1, "pre-test": 1, "pretest": 1,
-            "t0": 2, "t1": 3, "t2": 4, "t3": 5, "t4": 6,
-            "post": 10, "post-test": 10, "posttest": 10,
-            "follow": 20, "followup": 20, "follow-up": 20,
-        }
-        def _sem_key(v):
-            s = str(v).strip().lower().replace(" ", "")
-            if s in _sem_order:
-                return _sem_order[s]
-            for prefix in ("session", "visit", "week", "month", "wave", "time", "v"):
-                if s.startswith(prefix):
-                    tail = s[len(prefix):]
-                    try:
-                        return 100 + float(tail)
-                    except ValueError:
-                        pass
-            return 999
-        sem_scores = [_sem_key(v) for v in unique_times]
-        if len(set(sem_scores)) > 1:
-            time_order = [t for _, t in sorted(zip(sem_scores, unique_times))]
-        else:
-            time_order = sorted(unique_times, key=str)
+    time_order = semantic_time_sort(unique_times)
 
     baseline_time = time_order[0]
     baseline_map  = (
@@ -183,6 +156,78 @@ def _conf_badge(detected_val, selected_val, label):
     if detected_val == selected_val:
         return f"<span style='font-size:0.68rem;color:#4caf8a;'>✓ {label}: auto-detected</span>"
     return f"<span style='font-size:0.68rem;color:#ecb84a;'>✎ {label}: manually set</span>"
+
+
+def semantic_time_sort(values):
+    """
+    Return a sorted list of timepoint labels using the most appropriate strategy:
+      1. Pure numeric  (0, 1, 2 …)
+      2. Semantic keywords  (baseline < pre < t0/t1… < post < follow-up)
+      3. Prefix + number  (session1 < session2, week4 < week8 …)
+      4. Alphabetical fallback
+
+    This is the single source of truth for x-axis order in plots and for
+    determining the baseline timepoint in baseline correction.
+    """
+    vals = list(values)
+
+    # Priority 1: numeric
+    try:
+        return sorted(vals, key=lambda x: float(x))
+    except (ValueError, TypeError):
+        pass
+
+    # Priority 2 & 3: semantic + prefix-number
+    _SEM = {
+        "baseline": 0, "bl": 0,
+        "pre": 10, "pretest": 10, "pre-test": 10, "pre test": 10,
+        "t0": 20,
+        "t1": 30, "time1": 30, "timepoint1": 30,
+        "t2": 40, "time2": 40, "timepoint2": 40,
+        "t3": 50, "time3": 50,
+        "t4": 60, "time4": 60,
+        "t5": 70, "time5": 70,
+        "post": 100, "posttest": 100, "post-test": 100, "post test": 100,
+        "post4w": 110, "post4wk": 110, "post4week": 110,
+        "post8w": 120, "post8wk": 120, "post8week": 120,
+        "post12w": 130, "post12wk": 130,
+        "follow": 200, "followup": 200, "follow-up": 200, "follow up": 200,
+        "3mfu": 210, "6mfu": 220, "12mfu": 230,
+    }
+    _PREFIXES = (
+        "session", "visit", "week", "month", "wave", "time",
+        "day", "hour", "v", "s", "w",
+    )
+
+    def _key(v):
+        s = str(v).strip().lower().replace(" ", "").replace("-", "").replace("_", "")
+        # exact semantic match
+        if s in _SEM:
+            return _SEM[s]
+        # prefix + number  (e.g. session3 → 1003, week12 → 10012)
+        for p in _PREFIXES:
+            if s.startswith(p):
+                tail = s[len(p):]
+                try:
+                    return 1000 + float(tail)
+                except ValueError:
+                    pass
+        # "post" + number  (e.g. post4w → handled above, but post6 → 100+6)
+        if s.startswith("post"):
+            tail = s[4:].lstrip("w").lstrip("wk")
+            try:
+                return 100 + float(tail)
+            except ValueError:
+                pass
+        return 9999  # unknown → end
+
+    scores = [_key(v) for v in vals]
+    # Use semantic sort only if it distinguishes at least some values
+    if len(set(scores)) > 1:
+        return [v for _, v in sorted(zip(scores, vals))]
+
+    # Priority 4: alphabetical
+    return sorted(vals, key=str)
 
 PLOT_STYLE = {
     "axes.facecolor": "#fffef9", "figure.facecolor": "#fffef9",
@@ -505,7 +550,9 @@ with st.expander("🔧  Filters", expanded=False):
     else:
         fcols = st.columns(min(len(fcands), 4))
         for fi, (cn, lbl) in enumerate(fcands):
-            rvals = sorted(df[cn].dropna().unique(), key=str)
+            # Use semantic ordering for time-like columns, alpha for others
+            _is_time_col = (roles_now.get("time_var") == cn)
+            rvals = semantic_time_sort(df[cn].dropna().unique()) if _is_time_col else sorted(df[cn].dropna().unique(), key=str)
             if cn not in fstate: fstate[cn] = {str(v): True for v in rvals}
             for v in rvals:
                 if str(v) not in fstate[cn]: fstate[cn][str(v)] = True
@@ -996,7 +1043,7 @@ elif model_choice == "Mixed Factorial ANOVA":
                 if bf != "— select —":
                     between_factors.append(bf)
                     n_lvl = df[bf].nunique()
-                    st.markdown(f"<div style='font-size:0.72rem;color:#9aa0b8;'>{n_lvl} levels: {', '.join(str(v) for v in sorted(df[bf].dropna().unique()))}</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div style='font-size:0.72rem;color:#9aa0b8;'>{n_lvl} levels: {', '.join(str(v) for v in sorted(df[bf].dropna().unique(), key=str))}</div>", unsafe_allow_html=True)
 
     # ── Tier 3: within-subjects factors ──────────────────────────────────────
     st.markdown("#### Within-subjects factors")
@@ -1015,7 +1062,7 @@ elif model_choice == "Mixed Factorial ANOVA":
                 if wf != "— select —":
                     within_factors.append(wf)
                     n_lvl = df[wf].nunique()
-                    st.markdown(f"<div style='font-size:0.72rem;color:#9aa0b8;'>{n_lvl} levels: {', '.join(str(v) for v in sorted(df[wf].dropna().unique()))}</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div style='font-size:0.72rem;color:#9aa0b8;'>{n_lvl} levels: {', '.join(str(v) for v in semantic_time_sort(df[wf].dropna().unique()))}</div>", unsafe_allow_html=True)
 
     # ── Tier 4: advanced options ──────────────────────────────────────────────
     with st.expander("⚙️  Advanced options", expanded=False):
@@ -1356,14 +1403,29 @@ elif model_choice == "Mixed Factorial ANOVA":
             st.markdown("<div style='font-size:0.82rem;color:#7a8299;margin-bottom:0.5rem;'>Shows the mean outcome for each group at each timepoint. Crossing lines = interaction.</div>", unsafe_allow_html=True)
             try:
                 means_df = df.groupby([a_bet[0], a_wit[0]])[a_out].agg(["mean","sem"]).reset_index()
+                # Determine the correct semantic order for the time axis
+                _time_vals   = means_df[a_wit[0]].dropna().unique().tolist()
+                _time_order  = semantic_time_sort(_time_vals)
+                _time_labels = [str(t) for t in _time_order]
                 with plt.rc_context(PLOT_STYLE):
                     fig, ax = plt.subplots(figsize=(7, 4))
                     colours = ["#2d3561","#c84b31","#ecb84a","#4caf8a","#9c27b0"]
                     for i, (grp, gdf) in enumerate(means_df.groupby(a_bet[0])):
-                        gdf = gdf.sort_values(a_wit[0])
-                        clr = colours[i % len(colours)]
-                        ax.plot(gdf[a_wit[0]].astype(str), gdf["mean"], marker="o", lw=2, color=clr, label=str(grp))
-                        ax.fill_between(range(len(gdf)), gdf["mean"]-gdf["sem"], gdf["mean"]+gdf["sem"], alpha=0.12, color=clr)
+                        # Re-order this group's rows to match the semantic time order
+                        gdf = (
+                            gdf.set_index(a_wit[0])
+                               .reindex(_time_order)
+                               .reset_index()
+                               .dropna(subset=["mean"])
+                        )
+                        clr  = colours[i % len(colours)]
+                        x_pos = list(range(len(gdf)))   # numeric positions for fill_between
+                        x_lbl = [str(v) for v in gdf[a_wit[0]]]
+                        ax.plot(x_lbl, gdf["mean"], marker="o", lw=2, color=clr, label=str(grp))
+                        ax.fill_between(x_pos, gdf["mean"]-gdf["sem"], gdf["mean"]+gdf["sem"], alpha=0.12, color=clr)
+                    # Force x-axis to use the semantic order
+                    ax.set_xticks(list(range(len(_time_labels))))
+                    ax.set_xticklabels(_time_labels, fontsize=9)
                     ax.set_xlabel(a_wit[0], fontsize=10)
                     ax.set_ylabel(f"Mean {a_out}", fontsize=10)
                     ax.set_title(f"{a_out} by {a_bet[0]} × {a_wit[0]}", fontsize=12, fontfamily="serif", color="#1a1a2e")
