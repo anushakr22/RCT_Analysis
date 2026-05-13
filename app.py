@@ -119,6 +119,60 @@ def icc_calc(model_result):
     except Exception:
         return None
 
+def apply_baseline_correction(df, outcome_col, subject_col, time_col):
+    """
+    Subtract each participant's baseline (earliest timepoint) value from all
+    their observations. Returns a copy of the dataframe with the outcome adjusted.
+    Uses semantic ordering (pre < post < follow-up) so 'Pre' is always chosen
+    as the baseline even when alphabetical sort would pick 'Post' first.
+    """
+    df = df.copy()
+    unique_times = df[time_col].dropna().unique()
+
+    # Priority 1: numeric sort
+    try:
+        time_order = sorted(unique_times, key=lambda x: float(x))
+    except (ValueError, TypeError):
+        # Priority 2: semantic pre/baseline/post ordering
+        _sem_order = {
+            "baseline": 0, "pre": 1, "pre-test": 1, "pretest": 1,
+            "t0": 2, "t1": 3, "t2": 4, "t3": 5, "t4": 6,
+            "post": 10, "post-test": 10, "posttest": 10,
+            "follow": 20, "followup": 20, "follow-up": 20,
+        }
+        def _sem_key(v):
+            s = str(v).strip().lower().replace(" ", "")
+            if s in _sem_order:
+                return _sem_order[s]
+            for prefix in ("session", "visit", "week", "month", "wave", "time", "v"):
+                if s.startswith(prefix):
+                    tail = s[len(prefix):]
+                    try:
+                        return 100 + float(tail)
+                    except ValueError:
+                        pass
+            return 999
+        sem_scores = [_sem_key(v) for v in unique_times]
+        if len(set(sem_scores)) > 1:
+            time_order = [t for _, t in sorted(zip(sem_scores, unique_times))]
+        else:
+            time_order = sorted(unique_times, key=str)
+
+    baseline_time = time_order[0]
+    baseline_map  = (
+        df[df[time_col] == baseline_time]
+        .groupby(subject_col)[outcome_col]
+        .mean()
+    )
+    df["_baseline"] = df[subject_col].map(baseline_map)
+    df[outcome_col] = df[outcome_col] - df["_baseline"]
+    df.drop(columns=["_baseline"], inplace=True)
+    # Drop any participant who had no baseline observation (avoids NaN/index errors)
+    n_before = len(df)
+    df = df.dropna(subset=[outcome_col]).reset_index(drop=True)
+    n_dropped = n_before - len(df)
+    return df, baseline_time, n_dropped
+
 def _idx(options, value, fallback=0):
     try: return options.index(value) if value in options else fallback
     except: return fallback
@@ -582,6 +636,26 @@ if model_choice == "Linear Mixed Model (LMM)":
         lmm_re_cands  = [c for c in lmm_fixed if c != lmm_subject]
         lmm_re_slopes = st.multiselect("Random slopes", lmm_re_cands, label_visibility="collapsed", key="lmm_slopes")
 
+    # ── Baseline correction ───────────────────────────────────────────────────
+    lmm_n_timepoints = df[lmm_time].nunique() if lmm_time != "None" and lmm_time in df.columns else 0
+    lmm_bc_disabled  = (lmm_time == "None") or (lmm_n_timepoints <= 2)
+    lmm_bc_label     = "Baseline correction"
+    if lmm_time == "None":
+        lmm_bc_note = "Select a time variable to enable baseline correction."
+    elif lmm_n_timepoints <= 2:
+        lmm_bc_note = "Only 2 timepoints detected — baseline correction not needed (pre/post design)."
+    else:
+        lmm_bc_note = f"Subtracts each participant's value at the earliest timepoint from all their observations ({lmm_n_timepoints} timepoints detected)."
+    lmm_baseline_corr = st.checkbox(
+        lmm_bc_label,
+        value=False,
+        disabled=lmm_bc_disabled,
+        help=lmm_bc_note,
+        key="lmm_bc",
+    )
+    if not lmm_bc_disabled:
+        st.markdown(f"<div style='font-size:0.75rem;color:#9aa0b8;margin-top:-0.4rem;margin-bottom:0.4rem;'>{lmm_bc_note}</div>", unsafe_allow_html=True)
+
     # Guard
     if lmm_outcome == "— select —" or lmm_subject == "— select —":
         st.markdown("<div class='info-box'>↑ Set Outcome and Subject ID to continue.</div>", unsafe_allow_html=True)
@@ -632,6 +706,23 @@ if model_choice == "Linear Mixed Model (LMM)":
         with st.spinner("Fitting Linear Mixed Model…"):
             try:
                 mdf = df_safe.dropna(subset=[s_out, s_sub] + s_fe)
+                # ── Apply baseline correction if requested ─────────────────
+                s_time = sanitize_col(lmm_time) if lmm_time != "None" else None
+                _lmm_n_tp = mdf[s_time].nunique() if s_time and s_time in mdf.columns else 0
+                if lmm_baseline_corr and s_time and _lmm_n_tp > 2:
+                    mdf, _bl_t, _bl_dropped = apply_baseline_correction(mdf, s_out, s_sub, s_time)
+                    _bc_msg = (
+                        f"<div class='info-box'>📐 <b>Baseline correction applied</b> — "
+                        f"each participant's value at the earliest timepoint "
+                        f"(<b>{_bl_t}</b>) has been subtracted from their outcome scores."
+                    )
+                    if _bl_dropped > 0:
+                        _bc_msg += (
+                            f" <b>{_bl_dropped} row(s) removed</b> for participant(s) "
+                            f"who had no observation at the baseline timepoint."
+                        )
+                    _bc_msg += "</div>"
+                    st.markdown(_bc_msg, unsafe_allow_html=True)
                 for col in s_fe:
                     if df_safe[col].dtype == object or df_safe[col].nunique() <= 10:
                         mdf = mdf.copy(); mdf[col] = pd.Categorical(mdf[col])
@@ -945,6 +1036,25 @@ elif model_choice == "Mixed Factorial ANOVA":
         st.markdown("**Effect size**")
         st.markdown("<div style='font-size:0.82rem;color:#7a8299;'>Partial η² (eta-squared) is always reported. It tells you how much of the variance in the outcome is explained by each effect.</div>", unsafe_allow_html=True)
 
+    # ── Baseline correction ───────────────────────────────────────────────────
+    av_n_timepoints = df[within_factors[0]].nunique() if within_factors and within_factors[0] in df.columns else 0
+    av_bc_disabled  = (not within_factors) or (av_n_timepoints <= 2)
+    if not within_factors:
+        av_bc_note = "Select a within-subjects factor (time) to enable baseline correction."
+    elif av_n_timepoints <= 2:
+        av_bc_note = "Only 2 timepoints detected — baseline correction not needed (pre/post design)."
+    else:
+        av_bc_note = f"Subtracts each participant's value at the earliest timepoint from all their observations ({av_n_timepoints} timepoints detected)."
+    av_baseline_corr = st.checkbox(
+        "Baseline correction",
+        value=False,
+        disabled=av_bc_disabled,
+        help=av_bc_note,
+        key="av_bc",
+    )
+    if not av_bc_disabled:
+        st.markdown(f"<div style='font-size:0.75rem;color:#9aa0b8;margin-top:-0.4rem;margin-bottom:0.4rem;'>{av_bc_note}</div>", unsafe_allow_html=True)
+
     # ── Guard ─────────────────────────────────────────────────────────────────
     if av_outcome == "— select —" or av_subject == "— select —":
         st.markdown("<div class='info-box'>↑ Set Outcome and Subject ID to continue.</div>", unsafe_allow_html=True)
@@ -976,6 +1086,22 @@ elif model_choice == "Mixed Factorial ANOVA":
         with st.spinner("Running Mixed Factorial ANOVA…"):
             try:
                 adf = df[[av_outcome, av_subject] + between_factors + within_factors + av_covariates].dropna()
+                # ── Apply baseline correction if requested ─────────────────
+                _av_n_tp = adf[within_factors[0]].nunique() if within_factors else 0
+                if av_baseline_corr and within_factors and _av_n_tp > 2:
+                    adf, _bl_t, _bl_dropped = apply_baseline_correction(adf, av_outcome, av_subject, within_factors[0])
+                    _bc_msg = (
+                        f"<div class='info-box'>📐 <b>Baseline correction applied</b> — "
+                        f"each participant's value at the earliest timepoint "
+                        f"(<b>{_bl_t}</b>) has been subtracted from their outcome scores."
+                    )
+                    if _bl_dropped > 0:
+                        _bc_msg += (
+                            f" <b>{_bl_dropped} row(s) removed</b> for participant(s) "
+                            f"who had no observation at the baseline timepoint."
+                        )
+                    _bc_msg += "</div>"
+                    st.markdown(_bc_msg, unsafe_allow_html=True)
 
                 if within_factors and between_factors:
                     # Full mixed: use pingouin mixed_anova (supports 1 between, 1 within)
