@@ -685,14 +685,12 @@ if model_choice == "Linear Mixed Model (LMM)":
 
     # ── Baseline correction ───────────────────────────────────────────────────
     lmm_n_timepoints = df[lmm_time].nunique() if lmm_time != "None" and lmm_time in df.columns else 0
-    lmm_bc_disabled  = (lmm_time == "None") or (lmm_n_timepoints <= 2)
+    lmm_bc_disabled  = (lmm_time == "None")
     lmm_bc_label     = "Baseline correction"
     if lmm_time == "None":
         lmm_bc_note = "Select a time variable to enable baseline correction."
-    elif lmm_n_timepoints <= 2:
-        lmm_bc_note = "Only 2 timepoints detected — baseline correction not needed (pre/post design)."
     else:
-        lmm_bc_note = f"Subtracts each participant's value at the earliest timepoint from all their observations ({lmm_n_timepoints} timepoints detected)."
+        lmm_bc_note = f"Subtracts each participant's value at the earliest timepoint from all their observations ({lmm_n_timepoints} timepoint(s) detected)."
     lmm_baseline_corr = st.checkbox(
         lmm_bc_label,
         value=False,
@@ -755,8 +753,7 @@ if model_choice == "Linear Mixed Model (LMM)":
                 mdf = df_safe.dropna(subset=[s_out, s_sub] + s_fe)
                 # ── Apply baseline correction if requested ─────────────────
                 s_time = sanitize_col(lmm_time) if lmm_time != "None" else None
-                _lmm_n_tp = mdf[s_time].nunique() if s_time and s_time in mdf.columns else 0
-                if lmm_baseline_corr and s_time and _lmm_n_tp > 2:
+                if lmm_baseline_corr and s_time:
                     mdf, _bl_t, _bl_dropped = apply_baseline_correction(mdf, s_out, s_sub, s_time)
                     _bc_msg = (
                         f"<div class='info-box'>📐 <b>Baseline correction applied</b> — "
@@ -1085,13 +1082,11 @@ elif model_choice == "Mixed Factorial ANOVA":
 
     # ── Baseline correction ───────────────────────────────────────────────────
     av_n_timepoints = df[within_factors[0]].nunique() if within_factors and within_factors[0] in df.columns else 0
-    av_bc_disabled  = (not within_factors) or (av_n_timepoints <= 2)
+    av_bc_disabled  = (not within_factors)
     if not within_factors:
         av_bc_note = "Select a within-subjects factor (time) to enable baseline correction."
-    elif av_n_timepoints <= 2:
-        av_bc_note = "Only 2 timepoints detected — baseline correction not needed (pre/post design)."
     else:
-        av_bc_note = f"Subtracts each participant's value at the earliest timepoint from all their observations ({av_n_timepoints} timepoints detected)."
+        av_bc_note = f"Subtracts each participant's value at the earliest timepoint from all their observations ({av_n_timepoints} timepoint(s) detected)."
     av_baseline_corr = st.checkbox(
         "Baseline correction",
         value=False,
@@ -1134,8 +1129,7 @@ elif model_choice == "Mixed Factorial ANOVA":
             try:
                 adf = df[[av_outcome, av_subject] + between_factors + within_factors + av_covariates].dropna()
                 # ── Apply baseline correction if requested ─────────────────
-                _av_n_tp = adf[within_factors[0]].nunique() if within_factors else 0
-                if av_baseline_corr and within_factors and _av_n_tp > 2:
+                if av_baseline_corr and within_factors:
                     adf, _bl_t, _bl_dropped = apply_baseline_correction(adf, av_outcome, av_subject, within_factors[0])
                     _bc_msg = (
                         f"<div class='info-box'>📐 <b>Baseline correction applied</b> — "
