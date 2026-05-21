@@ -6,11 +6,18 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import io
+import os
 import re
 import warnings
 from scipy import stats
 from statsmodels.formula.api import mixedlm
 from statsmodels.nonparametric.smoothers_lowess import lowess as _lowess
+
+try:
+    import anthropic as _anthropic_lib
+    _ANTHROPIC_AVAILABLE = True
+except ImportError:
+    _ANTHROPIC_AVAILABLE = False
 
 from ingestion import (
     get_sheet_names,
@@ -229,6 +236,158 @@ def semantic_time_sort(values):
     # Priority 4: alphabetical
     return sorted(vals, key=str)
 
+# ═════════════════════════════════════════════════════════════════════════════
+# AI ANALYST
+# ═════════════════════════════════════════════════════════════════════════════
+_AI_SYSTEM = """You are an expert biostatistician and clinical researcher specializing in randomized controlled trials (RCTs). You are reviewing output from a statistical analysis app used by clinical researchers who may not be statisticians.
+
+When interpreting results:
+- Distinguish statistical significance from clinical significance — effect size matters
+- Cite the specific numbers (β, F, p, η², ICC) when drawing conclusions
+- Flag problems: small samples, assumption violations, near-zero effect sizes despite significance, etc.
+- Use plain, professional language appropriate for a journal-level audience
+- Never pad with generic advice — focus entirely on what these specific numbers say
+- Keep your response structured but concise"""
+
+def _get_client():
+    if not _ANTHROPIC_AVAILABLE:
+        return None
+    key = st.session_state.get("anthropic_api_key", "")
+    if not key:
+        return None
+    return _anthropic_lib.Anthropic(api_key=key)
+
+def _lmm_context(fe_df, lmm_res, outcome, group, time, formula):
+    icc = icc_calc(lmm_res)
+    lines = [
+        "Model: Linear Mixed Model (LMM)",
+        f"Outcome: {outcome}",
+        f"Group variable: {group}",
+        f"Time variable: {time}",
+        f"Formula: {formula}",
+        f"N observations: {int(lmm_res.nobs)}",
+        f"Log-likelihood: {lmm_res.llf:.4f}",
+    ]
+    if icc is not None:
+        lines.append(f"ICC (intraclass correlation): {icc:.4f}")
+    lines += ["", "Fixed Effects Table:", fe_df.to_string(index=False)]
+    return "\n".join(lines)
+
+def _anova_context(aov, ph, sph, outcome, between, within, ph_corr):
+    lines = [
+        "Model: Mixed Factorial ANOVA",
+        f"Outcome: {outcome}",
+        f"Between-subjects factors: {', '.join(between) if between else 'none'}",
+        f"Within-subjects factors: {', '.join(within) if within else 'none'}",
+        "",
+        "ANOVA Table:",
+        aov.to_string(index=False),
+    ]
+    if sph:
+        lines.append("\nSphericity (Mauchly's test):")
+        for wf, s in sph.items():
+            try:
+                if hasattr(s, '__len__') and len(s) >= 3:
+                    lines.append(f"  {wf}: W={s[1]:.3f}, p={s[2]:.4f} — {'OK' if s[0] else 'VIOLATED'}")
+            except Exception:
+                pass
+    if ph:
+        lines.append(f"\nPost-hoc comparisons (correction: {ph_corr}):")
+        for fac, res in ph.items():
+            if not isinstance(res, str):
+                lines += [f"\n{fac}:", res.to_string(index=False)]
+    return "\n".join(lines)
+
+def _call_claude(client, messages):
+    resp = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1200,
+        system=_AI_SYSTEM,
+        messages=messages,
+    )
+    return resp.content[0].text
+
+def render_ai_analyst(context_str, model_type, section_key):
+    client = _get_client()
+
+    st.markdown("---")
+    st.markdown("## AI Analyst")
+    st.markdown(
+        "<div class='info-box'>Powered by Claude — reads your actual numbers, flags clinical significance, "
+        "and answers follow-up questions in context.</div>",
+        unsafe_allow_html=True,
+    )
+
+    if not _ANTHROPIC_AVAILABLE:
+        st.markdown("<div class='warn-box'>Install the Anthropic SDK: <code>pip install anthropic</code></div>", unsafe_allow_html=True)
+        return
+    if client is None:
+        st.markdown("<div class='warn-box'>Enter your Anthropic API key in the sidebar to enable AI analysis.</div>", unsafe_allow_html=True)
+        return
+
+    tab_analysis, tab_chat = st.tabs(["📊 Interpretation", "💬 Ask the Analyst"])
+
+    # ── Auto-generated interpretation ─────────────────────────────────────────
+    with tab_analysis:
+        cache_key = f"ai_interp_{section_key}_{hash(context_str)}"
+        if cache_key not in st.session_state:
+            with st.spinner("Claude is reading your results…"):
+                try:
+                    prompt = (
+                        f"Here are the results from a {model_type} analysis on RCT data:\n\n"
+                        f"{context_str}\n\n"
+                        "Please provide:\n"
+                        "1. **Key findings** — what do these results mean for the intervention?\n"
+                        "2. **Clinical significance** — are the effects large enough to matter in practice?\n"
+                        "3. **Red flags** — any concerns about the model, assumptions, or data quality?\n"
+                        "4. **Reporting paragraph** — a draft sentence or two suitable for a journal Results section."
+                    )
+                    st.session_state[cache_key] = _call_claude(client, [{"role": "user", "content": prompt}])
+                except Exception as e:
+                    st.error(f"AI analysis failed: {e}")
+                    st.session_state[cache_key] = None
+
+        text = st.session_state.get(cache_key)
+        if text:
+            st.markdown(
+                f"<div class='summary-box' style='border-left-color:#4caf8a;white-space:pre-wrap;'>{text}</div>",
+                unsafe_allow_html=True,
+            )
+
+    # ── Conversational chat ────────────────────────────────────────────────────
+    with tab_chat:
+        hist_key = f"ai_chat_{section_key}_{hash(context_str)}"
+        if hist_key not in st.session_state:
+            st.session_state[hist_key] = []
+
+        for msg in st.session_state[hist_key]:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        user_q = st.chat_input("Ask about your results…", key=f"chat_input_{section_key}")
+        if user_q:
+            # Prepend the results context as a silent preamble pair so the
+            # model always has the numbers, even after many turns.
+            preamble = [
+                {"role": "user", "content": f"My statistical results:\n\n{context_str}\n\nKeep these in mind."},
+                {"role": "assistant", "content": "Understood — I have your results in context."},
+            ]
+            full_messages = preamble + st.session_state[hist_key] + [{"role": "user", "content": user_q}]
+
+            st.session_state[hist_key].append({"role": "user", "content": user_q})
+            with st.chat_message("user"):
+                st.markdown(user_q)
+
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking…"):
+                    try:
+                        answer = _call_claude(client, full_messages)
+                        st.markdown(answer)
+                        st.session_state[hist_key].append({"role": "assistant", "content": answer})
+                    except Exception as e:
+                        st.error(f"Chat failed: {e}")
+
+
 PLOT_STYLE = {
     "axes.facecolor": "#fffef9", "figure.facecolor": "#fffef9",
     "axes.spines.top": False, "axes.spines.right": False,
@@ -296,6 +455,7 @@ for _k, _v in {
     "lmm_safe_outcome": None, "lmm_safe_subject": None,
     "anova_result": None,
     "file_rejection": None,
+    "anthropic_api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
 }.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
@@ -310,6 +470,23 @@ with st.sidebar:
         <div style='font-family:DM Serif Display,serif;font-size:1.5rem;color:#fff;line-height:1.2;'>RCT · Analysis</div>
         <div style='font-size:0.75rem;color:#9aa0cc;margin-top:0.2rem;'>Statistical Analysis Suite</div>
     </div>""", unsafe_allow_html=True)
+    st.markdown("---")
+    st.markdown("### AI Analyst")
+    _key_input = st.text_input(
+        "Anthropic API key",
+        value=st.session_state.anthropic_api_key,
+        type="password",
+        placeholder="sk-ant-…",
+        label_visibility="collapsed",
+        key="_sidebar_api_key",
+    )
+    if _key_input != st.session_state.anthropic_api_key:
+        st.session_state.anthropic_api_key = _key_input
+    if st.session_state.anthropic_api_key:
+        st.markdown("<div style='font-size:0.72rem;color:#4caf8a;'>✓ API key set</div>", unsafe_allow_html=True)
+    else:
+        st.markdown("<div style='font-size:0.72rem;color:#9aa0cc;'>Enter key to enable AI analysis</div>", unsafe_allow_html=True)
+
     st.markdown("---")
     st.markdown("### Data")
     uploaded = st.file_uploader("Upload CSV or XLSX", type=["csv","xlsx"], label_visibility="collapsed")
@@ -985,6 +1162,10 @@ if model_choice == "Linear Mixed Model (LMM)":
         with st.expander("📄 Full statsmodels summary"):
             st.code(lmm_res.summary().as_text(), language="text")
 
+        # ── AI Analyst ─────────────────────────────────────────────────────────
+        _lmm_ctx = _lmm_context(fe_df, lmm_res, lmm_outcome, lmm_group, lmm_time, formula)
+        render_ai_analyst(_lmm_ctx, "Linear Mixed Model", "lmm")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ██  MODEL 2 — MIXED FACTORIAL ANOVA
@@ -1445,3 +1626,7 @@ elif model_choice == "Mixed Factorial ANOVA":
             if ph_frames:
                 buf2 = io.StringIO(); pd.concat(ph_frames, ignore_index=True).to_csv(buf2, index=False)
                 st.download_button("⬇  Post-hoc results (.csv)", data=buf2.getvalue(), file_name="posthoc_results.csv", mime="text/csv")
+
+        # ── AI Analyst ─────────────────────────────────────────────────────────
+        _anova_ctx = _anova_context(aov, ph, sph, a_out, a_bet, a_wit, ar["ph_corr"])
+        render_ai_analyst(_anova_ctx, "Mixed Factorial ANOVA", "anova")

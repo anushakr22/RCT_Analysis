@@ -6,3 +6,4 @@ statsmodels>=0.14.0
 scipy>=1.10.0
 openpyxl>=3.1.0
 pingouin>=0.5.4
+anthropic>=0.25.0
